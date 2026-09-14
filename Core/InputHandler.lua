@@ -27,6 +27,60 @@ WowCNLearnState = {
 -- [已挂载编辑框记录]
 local hookedBoxes = {}
 
+
+-- [UTF-8 安全辅助函数]
+-- WoW 1.12 的 Lua string.len/string.sub 按字节工作。
+-- 中文 UTF-8 字符通常占 3 个字节，直接 textLen - 1 会截断中文最后一个字节，
+-- 后续 SetText/重建文本时可能导致已经输入的字消失或损坏。
+local function WowCNInput_GetLastChar(text)
+    if not text or string.len(text) == 0 then return "" end
+
+    local len = string.len(text)
+    local first = len
+    while first > 1 do
+        local b = string.byte(text, first)
+        if not b or b < 128 or b > 191 then
+            break
+        end
+        first = first - 1
+    end
+    return string.sub(text, first, len)
+end
+
+local function WowCNInput_RemoveLastChar(text)
+    if not text or string.len(text) == 0 then return "" end
+
+    local len = string.len(text)
+    local first = len
+    while first > 1 do
+        local b = string.byte(text, first)
+        if not b or b < 128 or b > 191 then
+            break
+        end
+        first = first - 1
+    end
+    return string.sub(text, 1, first - 1)
+end
+
+-- 不把已确认文本当作 Lua pattern，避免已输入的 . [ ] % 等字符破坏匹配。
+local function WowCNInput_HasPrefix(text, prefix)
+    if not prefix or prefix == "" then return true end
+    return string.sub(text, 1, string.len(prefix)) == prefix
+end
+
+-- [聊天链接保护]
+-- WoW 聊天中的物品/任务/玩家链接通常以 |h|r 结尾。
+-- 末尾的 |r 是颜色恢复控制码，不能被输入法当成用户输入的字母 r。
+-- 否则 Shift+点击任务/物品链接后，候选框会错误显示 “r”。
+local function WowCNInput_IsChatLinkReset(text)
+    if not text or string.len(text) < 2 then return false end
+    if string.sub(text, string.len(text) - 1, string.len(text)) ~= "|r" then
+        return false
+    end
+    -- 只在文本中确实存在超链接控制码时拦截，避免影响普通的字母 r。
+    return string.find(text, "|H") ~= nil and string.find(text, "|h") ~= nil
+end
+
 --[[
     WowCNInput_IsHooked - 检查编辑框是否已挂载
     参数: box - 编辑框对象
@@ -381,20 +435,28 @@ function WowCNInput_HookEditBox(box)
         local text = this:GetText()
         local textLen = string.len(text)
         
+        -- Shift+点击任务/物品等聊天链接后，EditBox 文本可能以 |H...|h...|h|r 结尾。
+        -- 最后的 “r” 是 WoW 的颜色控制码，不是真实输入，不能进入拼音候选。
+        if WowCNInput_IsChatLinkReset(text) then
+            WowCNInput_ClearState()
+            WowCNInputFrame:Hide()
+            return
+        end
+        
         if textLen == 0 then
             WowCNInput_ClearState()
             WowCNInputFrame:Hide()
             return
         end
 
-        local lastChar = string.sub(text, textLen, textLen)
+        local lastChar = WowCNInput_GetLastChar(text)
         local isLetter = (lastChar >= "a" and lastChar <= "z") or (lastChar >= "A" and lastChar <= "Z")
         
         -- [核心] 多行编辑框回车处理
         -- 如果处于候选模式且检测到换行符，说明用户按了回车
         if WowCNState.isCandidateMode and lastChar == "\n" then
             -- 移除换行符
-            local prevText = string.sub(text, 1, textLen - 1)
+            local prevText = WowCNInput_RemoveLastChar(text)
             WowCNState.isReplacing = true
             this:SetText(prevText)
             WowCNState.isReplacing = false
@@ -408,7 +470,7 @@ function WowCNInput_HookEditBox(box)
             local confirmedText = WowCNState.confirmedText
             
             -- 检查当前文本是否以已确认文本开头
-            if string.len(confirmedText) > 0 and string.find(text, "^" .. confirmedText) then
+            if string.len(confirmedText) > 0 and WowCNInput_HasPrefix(text, confirmedText) then
                 -- 当前文本以已确认文本开头，检查后面是否有新输入
                 local afterConfirmed = string.sub(text, string.len(confirmedText) + 1)
                 
@@ -444,11 +506,11 @@ function WowCNInput_HookEditBox(box)
                     
                     -- 如果是空格选词，去掉空格后检查
                     if lastChar == " " then
-                        beforeLastChar = string.sub(afterConfirmed, 1, string.len(afterConfirmed) - 1)
+                        beforeLastChar = WowCNInput_RemoveLastChar(afterConfirmed)
                         startPos, endPos, prevLetters = string.find(beforeLastChar, "([a-zA-Z]+)$")
                     else
                         -- 数字选词，去掉最后一个数字字符
-                        beforeLastChar = string.sub(afterConfirmed, 1, string.len(afterConfirmed) - 1)
+                        beforeLastChar = WowCNInput_RemoveLastChar(afterConfirmed)
                         startPos, endPos, prevLetters = string.find(beforeLastChar, "([a-zA-Z]+)$")
                     end
                     
@@ -519,7 +581,7 @@ function WowCNInput_HookEditBox(box)
             return
         end
         
-        local prevText = string.sub(text, 1, textLen - 1)
+        local prevText = WowCNInput_RemoveLastChar(text)
         
         local searchPrevText = prevText
         if WowCNState.confirmedEnglishLength > 0 then
